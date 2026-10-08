@@ -1,0 +1,1552 @@
+--[[
+=====================================================================
+   SILENT AIM
+=====================================================================
+   Что это:
+   - Silent Aim через Camera.CFrame (поворот камеры + клик)
+   - Wallbang по толщине стен через ACS_Settings
+   - Zero Recoil / Zero Spread
+   - AIM Check (зажать клавишу чтобы работал аим)
+   - Repeat Mode: RPM / Time (0 = до смерти цели)
+   - Hold After Shot, Clicks Count, Click Interval
+   - Trigger Bot (авто-клик когда прицел на цели)
+=====================================================================
+]]
+
+debugX = true
+
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+-- ============================================================
+-- СЕРВИСЫ
+-- ============================================================
+local Players          = game:GetService("Players")          -- игроки
+local RunService       = game:GetService("RunService")       -- RenderStepped / Heartbeat
+local UserInputService = game:GetService("UserInputService") -- ввод, мышь, клавиатура
+local Workspace        = game:GetService("Workspace")        -- мир
+local LocalPlayer      = Players.LocalPlayer                 -- локальный игрок
+local Camera           = Workspace.CurrentCamera             -- текущая камера
+
+-- Обновляем переменную камеры при её смене
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+   Camera = Workspace.CurrentCamera
+end)
+
+-- ============================================================
+-- ФЛАГ ВЫГРУЗКИ
+-- ============================================================
+local Unloaded = false        -- когда true — все циклы выходят
+local Connections = {}        -- список коннектов для отключения при Unload
+local function addConn(c) table.insert(Connections, c); return c end
+
+-- ============================================================
+-- ОБЩЕЕ СОСТОЯНИЕ для Cframe Aim / Mouse Aim
+-- ============================================================
+local State = {
+   TargetPart = "Head",          -- куда наводиться: Head / Torso / Center
+   PredictMode = "Custom",       -- Custom / Auto
+   PredictCustom = 50,           -- мс предсказания (Custom)
+   WallCheck = true,             -- проверять стены
+   Targets = { Player = true, Npc_Humanoid = false, Npc_Workspace = false },
+   -- Cframe режим (плавный поворот камеры)
+   Cframe = { Enabled = false, Speed = 50, LoopTarget = false, Locked = nil },
+   -- Mouse режим (движение мыши через mousemoverel)
+   Mouse  = { Enabled = false, Speed = 25, LoopTarget = false, Locked = nil },
+}
+
+-- ============================================================
+-- ХЕЛПЕРЫ: получить часть тела у персонажа
+-- ============================================================
+local function getPartFromCharacter(char, partType)
+   if not char or not char.Parent then return nil end
+   local head = char:FindFirstChild("Head")
+   local torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+      or char:FindFirstChild("LowerTorso") or char:FindFirstChild("HumanoidRootPart")
+   if partType == "Head" then return head end
+   if partType == "Torso" then return torso end
+   return char:FindFirstChild("HumanoidRootPart") or torso or head -- Center
+end
+
+-- Проверка: NPC с Humanoid + HumanoidRootPart + Head + Torso
+local function isNpcHumanoid(model)
+   if not model:FindFirstChildOfClass("Humanoid") then return false end
+   if not model:FindFirstChild("HumanoidRootPart") then return false end
+   if not model:FindFirstChild("Head") then return false end
+   local torso = model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model:FindFirstChild("LowerTorso")
+   return torso ~= nil
+end
+
+-- Собрать список целей (для Cframe / Mouse)
+local function collectTargets(targetsCfg)
+   if Unloaded then return {} end
+   local list = {}
+   local T = targetsCfg or State.Targets
+
+   -- Игроки
+   if T.Player then
+      for _, plr in ipairs(Players:GetPlayers()) do
+         if plr ~= LocalPlayer and plr.Character then
+            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then table.insert(list, plr.Character) end
+         end
+      end
+   end
+   -- NPC по Humanoid
+   if T.Npc_Humanoid then
+      for _, d in ipairs(Workspace:GetDescendants()) do
+         if d:IsA("Model") and isNpcHumanoid(d) and not Players:GetPlayerFromCharacter(d) then
+            local hum = d:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then table.insert(list, d) end
+         end
+      end
+   end
+   -- NPC в папках (Npc_Workspace)
+   if T.Npc_Workspace then
+      local folders = {"NPCs", "Npcs", "npcs", "Enemies", "Mobs", "Monsters", "Bots"}
+      for _, name in ipairs(folders) do
+         local folder = Workspace:FindFirstChild(name, true)
+         if folder then
+            for _, d in ipairs(folder:GetDescendants()) do
+               if d:IsA("Model") and d:FindFirstChild("HumanoidRootPart") then table.insert(list, d) end
+            end
+         end
+      end
+   end
+   return list
+end
+
+-- Проверка линии видимости (WallCheck для Cframe / Mouse)
+local function hasLineOfSightFor(fromPos, toPart, wallCheckFlag)
+   if not wallCheckFlag then return true end
+   local params = RaycastParams.new()
+   params.FilterType = Enum.RaycastFilterType.Exclude
+   params.FilterDescendantsInstances = { LocalPlayer.Character, toPart.Parent }
+   params.IgnoreWater = true
+   local result = Workspace:Raycast(fromPos, toPart.Position - fromPos, params)
+   return result == nil
+end
+
+-- Предсказание позиции с учётом скорости цели
+local function getPredictedPositionFor(part, predictMode, predictCustom)
+   if not part then return nil end
+   local pos = part.Position
+   local velocity = part.AssemblyLinearVelocity or Vector3.zero
+   local ms = (predictMode == "Custom") and predictCustom or math.clamp(velocity.Magnitude * 4, 0, 200)
+   return pos + velocity * (ms / 1000)
+end
+
+-- Проверка, что залоченная цель жива
+local function isLockedValidFor(part, wallCheck)
+   if not part or not part.Parent then return false end
+   local char = part.Parent
+   local hum = char:FindFirstChildOfClass("Humanoid")
+   if hum and hum.Health <= 0 then return false end
+   local cam = Workspace.CurrentCamera
+   if not cam then return false end
+   if not hasLineOfSightFor(cam.CFrame.Position, part, wallCheck) then return false end
+   local _, onScreen = cam:WorldToViewportPoint(part.Position)
+   if not onScreen then return false end
+   local dist = (part.Position - cam.CFrame.Position).Magnitude
+   return dist <= 1000
+end
+
+-- Поиск лучшей цели (ближайшей к центру экрана) для Cframe / Mouse
+local function findBestTarget(modeState, targetsCfg, targetPart, wallCheck)
+   if Unloaded then return nil end
+   if modeState.LoopTarget and modeState.Locked then
+      if isLockedValidFor(modeState.Locked, wallCheck) then return modeState.Locked
+      else modeState.Locked = nil end
+   end
+   local cam = Workspace.CurrentCamera
+   if not cam then return nil end
+   local targets = collectTargets(targetsCfg)
+   if #targets == 0 then return nil end
+   local tp = targetPart or State.TargetPart
+   local best, bestDist = nil, math.huge
+   local myPos = cam.CFrame.Position
+   local center = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+   for _, char in ipairs(targets) do
+      local part = getPartFromCharacter(char, tp)
+      if part and hasLineOfSightFor(myPos, part, wallCheck) then
+         local screenPoint, onScreen = cam:WorldToViewportPoint(part.Position)
+         if onScreen then
+            local d = (Vector2.new(screenPoint.X, screenPoint.Y) - center).Magnitude
+            if d < bestDist then bestDist = d; best = part end
+         end
+      end
+   end
+   if best and modeState.LoopTarget then modeState.Locked = best end
+   return best
+end
+
+-- ============================================================
+-- НАСТРОЙКИ SILENT AIM / WALLBANG / TRIGGER BOT
+-- ============================================================
+local SETTINGS = {
+   -- Silent Aim
+   Enabled = false,        -- включён/выключен
+   AutoFire = true,        -- кликать автоматически
+   BlockMouse = true,      -- блокировать мышь во время выстрела
+   SnapDelay = 0.02,       -- сколько держать камеру до выстрела (сек)
+   CooldownMult = 1.0,     -- множитель cooldown
+   CooldownMin = 0.05,     -- минимум cooldown
+   CooldownMax = 1.0,      -- максимум cooldown
+   TargetPart = "Head",    -- какая часть тела у цели
+   MaxDistance = 1000,     -- максимальная дистанция
+   FOV = 300,              -- радиус FOV от курсора
+   WallCheck = true,       -- проверять стены
+   TeamCheck = true,       -- не бить союзников
+   ShowFOV = true,         -- показывать круг FOV
+   TargetNPCs = true,      -- целиться в NPC
+   TargetPlayers = false,  -- целиться в игроков
+   CheckAmmo = true,       -- проверять патроны
+   CheckJammed = true,     -- проверять заклинивание
+   ZeroRecoil = false,     -- обнулять recoil
+   ZeroSpread = false,     -- обнулять spread
+   -- Wallbang
+   WallOriginMode = "muzzle", -- muzzle / camera / root
+   WallbangMult = 1.0,        -- множитель силы wallbang
+   WallbangOverride = false,  -- заменить wallbang оружия на своё
+   WallbangOverrideVal = 10.0,-- своё значение wallbang
+   MaxWallThickness = 10.0,   -- максимум толщины 1 стены
+   -- Loop
+   LoopSpeedMult = 1.0,       -- множитель скорости цикла
+   AimCheckEnabled = true,    -- аим только при зажатой клавише
+   AimCheckKey = Enum.UserInputType.MouseButton2, -- ПКМ
+   RepeatMode = "RPM",        -- RPM / Time
+   FixedTimeDelay = 0.5,      -- фиксированная пауза (Time mode, 0 = до смерти)
+   HoldAfterShot = 0.001,     -- держать камеру после выстрела
+   ClicksCount = 1,           -- сколько кликов за цикл
+   ClickInterval = 0.02,      -- пауза перед каждым кликом
+   -- TRIGGER BOT
+   TriggerEnabled = false,       -- включён ли trigger bot
+   TriggerHoldBefore = 0.02,     -- задержка перед выстрелом (сек)
+   TriggerWallCheck = true,      -- проверять стены
+   TriggerTargets = {            -- во что целиться
+      Head = true,
+      Torso = false,
+      All = false,
+   },
+   TriggerCooldown = 0.1,        -- пауза между выстрелами
+}
+
+-- ============================================================
+-- AIM CHECK (зажатие клавиши)
+-- ============================================================
+local aimHeld = false
+UserInputService.InputBegan:Connect(function(input, gpe)
+   if gpe then return end
+   if input.UserInputType == SETTINGS.AimCheckKey or input.KeyCode == SETTINGS.AimCheckKey then
+      aimHeld = true
+   end
+end)
+UserInputService.InputEnded:Connect(function(input)
+   if input.UserInputType == SETTINGS.AimCheckKey or input.KeyCode == SETTINGS.AimCheckKey then
+      aimHeld = false
+   end
+end)
+
+local function isAimHeld()
+   if not SETTINGS.AimCheckEnabled then return true end
+   return aimHeld
+end
+
+-- ============================================================
+-- PATTERN SET — таблицы для поиска ammo/jammed/zero
+-- ============================================================
+-- Имена ValueObject/Attributes для "патронов в обойме"
+local AMMO_PATTERN_SET = {
+   ["acsclientammoingun"]=true, ["acsammoingun"]=true, ["acsammo"]=true,
+   ["acsclipammo"]=true, ["acsclip"]=true, ["acsgunammo"]=true,
+   ["acsgunclip"]=true, ["acsbulletcount"]=true, ["acsbullets"]=true,
+   ["acsrounds"]=true, ["acsammoleft"]=true, ["acsmagammo"]=true,
+   ["ammoingun"]=true, ["ammoinmag"]=true, ["ammoinclip"]=true,
+   ["ammoinchamber"]=true, ["ammoincylinder"]=true, ["ammoinbarrel"]=true,
+   ["ammocount"]=true, ["ammocountgun"]=true, ["ammogun"]=true,
+   ["ammoleft"]=true, ["ammoleftgun"]=true, ["ammoleftingun"]=true,
+   ["ammoremaining"]=true, ["ammoremain"]=true, ["ammoloaded"]=true,
+   ["ammochamber"]=true, ["ammobarrel"]=true, ["ammomag"]=true,
+   ["ammomagazine"]=true, ["ammoclip"]=true, ["ammodrum"]=true,
+   ["ammopouch"]=true, ["ammobelt"]=true,
+   ["currentammo"]=true, ["currentclip"]=true, ["currentrounds"]=true,
+   ["currentbullets"]=true, ["currentshot"]=true, ["currentmag"]=true,
+   ["currentchamber"]=true, ["currentloaded"]=true, ["currentingun"]=true,
+   ["clipammo"]=true, ["clipcount"]=true, ["clipleft"]=true,
+   ["cliprounds"]=true, ["clipbullets"]=true, ["clipcurrent"]=true,
+   ["clippingun"]=true, ["clipmag"]=true, ["clipmagazine"]=true,
+   ["magammo"]=true, ["magcount"]=true, ["magleft"]=true,
+   ["magrounds"]=true, ["magbullets"]=true, ["magcurrent"]=true,
+   ["magazineammo"]=true, ["magazinecount"]=true, ["magazineleft"]=true,
+   ["magazinerounds"]=true, ["magazinebullets"]=true, ["magazinecurrent"]=true,
+   ["magazineingun"]=true, ["magazinemag"]=true,
+   ["bulletcount"]=true, ["bulletsleft"]=true, ["bulletsremaining"]=true,
+   ["bulletsingun"]=true, ["bulletmag"]=true, ["bulletclip"]=true,
+   ["bulletchamber"]=true, ["bulletinmag"]=true,
+   ["roundsleft"]=true, ["roundsremaining"]=true, ["roundsingun"]=true,
+   ["roundsinmag"]=true, ["roundsinclip"]=true, ["roundsinchamber"]=true,
+   ["roundscount"]=true, ["roundsloaded"]=true,
+   ["shellleft"]=true, ["shellsin"]=true, ["shellcount"]=true,
+   ["shellchamber"]=true, ["shellscount"]=true, ["shellschamber"]=true,
+   ["shellsloaded"]=true,
+   ["chambered"]=true, ["chamberedbullet"]=true, ["chambercount"]=true,
+   ["chamberhas"]=true, ["chamberfull"]=true, ["chamberloaded"]=true,
+   ["chamberround"]=true,
+   ["loadedammo"]=true, ["loadedbullets"]=true, ["loadedrounds"]=true,
+   ["loadedshot"]=true, ["loadedmag"]=true, ["loadedclip"]=true,
+   ["loadedgun"]=true, ["loadedweapon"]=true,
+   ["gunammo"]=true, ["gunbullets"]=true, ["gunrounds"]=true,
+   ["gunmag"]=true, ["gunclip"]=true, ["guncurrent"]=true,
+   ["gunloaded"]=true, ["gunshot"]=true,
+   ["shotsleft"]=true, ["shotcount"]=true, ["shotremaining"]=true,
+   ["shotloaded"]=true, ["shotsingun"]=true, ["shotbullets"]=true,
+   ["weaponammo"]=true, ["weaponbullets"]=true, ["weaponrounds"]=true,
+   ["weaponclip"]=true, ["weaponmag"]=true, ["weaponloaded"]=true,
+   ["weaponcurrent"]=true, ["weaponshot"]=true,
+   ["ammo_in_gun"]=true, ["ammo_in_mag"]=true, ["ammo_in_clip"]=true,
+   ["ammo_in_chamber"]=true, ["ammo_in_cylinder"]=true, ["ammo_in_barrel"]=true,
+   ["bullets_in_gun"]=true, ["bullets_in_mag"]=true, ["bullets_in_clip"]=true,
+   ["rounds_in_gun"]=true, ["rounds_in_mag"]=true, ["rounds_in_clip"]=true,
+   ["shells_in_gun"]=true, ["shells_in_chamber"]=true,
+   ["gun_ammo"]=true, ["gun_ammo_left"]=true, ["gun_loaded"]=true,
+   ["current_ammo"]=true, ["current_ammo_in_mag"]=true, ["current_loaded_ammo"]=true,
+   ["патроныворужии"]=true, ["патронывобойме"]=true, ["патронывмагазине"]=true,
+   ["патронывстволе"]=true, ["заряженопатронов"]=true, ["патроновзаряжено"]=true,
+   ["патроноввобойме"]=true, ["патроновворужии"]=true, ["патроноввмагазине"]=true,
+   ["осталосьпатронов"]=true, ["текущиепатроны"]=true, ["текущийпатрон"]=true,
+}
+
+-- Имена, которые НЕ надо путать с ammo (общий запас и т.д.)
+local AMMO_STOP_SET = {
+   ["storedammo"]=true, ["maxstoredammo"]=true, ["reserveammo"]=true,
+   ["ammostorage"]=true, ["ammoreserve"]=true, ["totalammo"]=true,
+   ["ammototal"]=true, ["ammopool"]=true, ["ammobackup"]=true,
+   ["ammobank"]=true, ["ammocache"]=true, ["ammowarehouse"]=true,
+   ["ammoinventory"]=true, ["ammosupply"]=true, ["ammosupplies"]=true,
+   ["ammoreservoir"]=true, ["spareammo"]=true, ["extraammo"]=true,
+   ["backupammo"]=true, ["sparerounds"]=true, ["extrarounds"]=true,
+   ["backuprrounds"]=true, ["maxammo"]=true, ["ammomax"]=true,
+   ["maxclip"]=true, ["maxmag"]=true, ["clipmax"]=true, ["magmax"]=true,
+   ["maxbullet"]=true, ["maxround"]=true, ["maxshell"]=true,
+   ["maxcartridge"]=true, ["maxcapacity"]=true, ["maxload"]=true,
+   ["maxstored"]=true, ["maxreserve"]=true, ["clipcapacity"]=true,
+   ["magcapacity"]=true, ["magazinecapacity"]=true,
+   ["gunmaxammo"]=true, ["weaponmaxammo"]=true, ["toolmaxammo"]=true,
+   ["ammocapacity"]=true, ["weaponcapacity"]=true,
+   ["clipmaxammo"]=true, ["magmaxammo"]=true, ["magazinemaxammo"]=true,
+   ["isreloading"]=true, ["reloading"]=true, ["reloadtime"]=true,
+   ["reloadprogress"]=true, ["reloadstate"]=true, ["reloadspeed"]=true,
+   ["reloadstart"]=true, ["reloadend"]=true,
+   ["hasammo"]=true, ["noammo"]=true, ["outofammo"]=true, ["emptygun"]=true,
+   ["ammotype"]=true, ["ammoname"]=true, ["ammoid"]=true, ["ammokind"]=true,
+   ["ammodamage"]=true, ["ammospeed"]=true, ["ammopower"]=true, ["ammoweight"]=true,
+   ["ammosize"]=true, ["ammocaliber"]=true, ["ammogauge"]=true,
+}
+
+-- Имена для "заклинило"
+local JAMMED_SET = {
+   ["jammed"]=true, ["isjammed"]=true, ["isjam"]=true, ["jam"]=true,
+   ["jamstate"]=true, ["jamstatus"]=true,
+   ["gunjammed"]=true, ["weaponjammed"]=true, ["tooljammed"]=true,
+   ["playerjammed"]=true, ["gunjam"]=true, ["weaponjam"]=true, ["tooljam"]=true,
+   ["jammedstate"]=true, ["jammedstatus"]=true, ["jammedvalue"]=true,
+   ["jammedflag"]=true, ["jamflag"]=true, ["jamvalue"]=true,
+   ["jamamount"]=true, ["jamcount"]=true,
+   ["isgunjammed"]=true, ["isweaponjammed"]=true, ["istooljammed"]=true,
+   ["hasjam"]=true, ["hasjammed"]=true, ["getjammed"]=true, ["setjammed"]=true,
+   ["acsclientjammed"]=true, ["acsjam"]=true, ["acsjammed"]=true,
+   ["weaponisjammed"]=true, ["gunisjammed"]=true, ["toolisjammed"]=true,
+   ["isjamming"]=true, ["jamming"]=true, ["jammedbool"]=true,
+}
+
+local JAMMED_STOP_SET = {
+   ["jammer"]=true, ["jamsound"]=true, ["jamanim"]=true, ["jamsfx"]=true,
+}
+
+-- Имена для recoil/spread (обнуление)
+local ZERO_SET = {
+   ["recoil"]=true, ["spread"]=true, ["inaccuracy"]=true,
+   ["kickback"]=true, ["kick"]=true,
+   ["recoilpower"]=true, ["spreadpower"]=true,
+   ["recoilamount"]=true, ["spreadamount"]=true,
+   ["aiminaccuracy"]=true, ["aimspread"]=true, ["aimrecoil"]=true,
+   ["hipspread"]=true, ["hiprecoil"]=true, ["adsspread"]=true, ["adsrecoil"]=true,
+   ["gunrecoil"]=true, ["gunspread"]=true,
+   ["camrecoil"]=true, ["camspread"]=true,
+   ["weaponrecoil"]=true, ["weaponspread"]=true,
+   ["minrecoil"]=true, ["maxrecoil"]=true, ["minspread"]=true, ["maxspread"]=true,
+   ["recoilup"]=true, ["recoildown"]=true, ["recoilleft"]=true, ["recoilright"]=true,
+   ["recoiltilt"]=true, ["recoilx"]=true, ["recoily"]=true,
+   ["recoilhorizontal"]=true, ["recoilvertical"]=true,
+   ["spreadx"]=true, ["spready"]=true,
+   ["spreadhorizontal"]=true, ["spreadvertical"]=true,
+   ["inaccuracystep"]=true, ["inaccuracydecrease"]=true,
+   ["aiminaccuracystep"]=true, ["aiminaccuracydecrease"]=true,
+   ["recoilpowerstep"]=true, ["recoilpowerstepamount"]=true,
+   ["recoilstep"]=true, ["recoilstepamount"]=true,
+   ["spreadstep"]=true, ["spreadstepamount"]=true,
+   ["recoilreduction"]=true, ["spreadreduction"]=true,
+   ["recoildecrease"]=true, ["spreaddecrease"]=true,
+   ["recoilrecovery"]=true, ["spreadrecovery"]=true,
+   ["recoildecay"]=true, ["spreaddecay"]=true,
+   ["recoilcontrol"]=true, ["spreadcontrol"]=true,
+   ["verticalrecoil"]=true, ["horizontalrecoil"]=true,
+   ["verticalspread"]=true, ["horizontalspread"]=true,
+   ["camerarecoil"]=true, ["cameraspread"]=true,
+   ["walkrecoil"]=true, ["walkspread"]=true,
+   ["jumprecoil"]=true, ["jumpspread"]=true,
+   ["crouchrecoil"]=true, ["crouchspread"]=true,
+   ["pronerecoil"]=true, ["pronespread"]=true,
+   ["bulletspread"]=true, ["bulletrecoil"]=true, ["bulletinaccuracy"]=true,
+}
+
+-- Нормализация имени (нижний регистр + убрать пробелы/подчёркивания/дефисы)
+local function normalizeName(s) return tostring(s):lower():gsub("[%s_%-]", "") end
+
+-- Проверки по именам
+local function isAmmoName(name)
+   local n = normalizeName(name)
+   if AMMO_STOP_SET[n] then return false end
+   return AMMO_PATTERN_SET[n] == true
+end
+local function isJammedName(name)
+   local n = normalizeName(name)
+   if JAMMED_STOP_SET[n] then return false end
+   return JAMMED_SET[n] == true
+end
+local function isZeroName(name)
+   local n = normalizeName(name)
+   return ZERO_SET[n] == true
+end
+
+-- ============================================================
+-- ACS SETTINGS (модуль внутри Tool)
+-- ============================================================
+-- Достаём таблицу ACS_Settings из Tool
+local function getOrCreateSettings(tool)
+   if not tool then return nil end
+   local mod = tool:FindFirstChild("ACS_Settings")
+   if not mod then return nil end
+   local ok, data = pcall(require, mod)
+   if ok and type(data) == "table" then return data end
+   return nil
+end
+
+-- Достать значение по пути "a.b.1"
+local function getByPath(tbl, path)
+   local parts = {}
+   for p in path:gmatch("[^%.]+") do parts[#parts+1] = p end
+   local cur = tbl
+   for _, p in ipairs(parts) do
+      if type(cur) ~= "table" then return nil, false end
+      cur = cur[p]
+   end
+   if cur == nil then return nil, false end
+   return cur, true
+end
+
+-- Записать значение по пути "a.b.1" (если путь существует)
+local function setByPathSafe(tbl, path, value)
+   local parts = {}
+   for p in path:gmatch("[^%.]+") do parts[#parts+1] = p end
+   local cur = tbl
+   for i = 1, #parts - 1 do
+      if type(cur[parts[i]]) ~= "table" then return false end
+      cur = cur[parts[i]]
+   end
+   local key = parts[#parts]
+   if cur[key] == nil then return false end
+   cur[key] = value
+   return true
+end
+
+-- Пути recoil/spread в ACS_Settings (обнуляются)
+local ZERO_RECOIL_PATHS_STATIC = {
+   "gunRecoil.gunRecoilUp.1", "gunRecoil.gunRecoilUp.2",
+   "gunRecoil.gunRecoilLeft.1", "gunRecoil.gunRecoilLeft.2",
+   "gunRecoil.gunRecoilRight.1", "gunRecoil.gunRecoilRight.2",
+   "gunRecoil.gunRecoilTilt.1", "gunRecoil.gunRecoilTilt.2",
+   "camRecoil.camRecoilUp.1", "camRecoil.camRecoilUp.2",
+   "camRecoil.camRecoilLeft.1", "camRecoil.camRecoilLeft.2",
+   "camRecoil.camRecoilRight.1", "camRecoil.camRecoilRight.2",
+   "camRecoil.camRecoilTilt.1", "camRecoil.camRecoilTilt.2",
+   "MinSpread", "MaxSpread",
+   "MinRecoilPower", "MaxRecoilPower",
+   "RecoilPowerStepAmount",
+   "AimInaccuracyStepAmount", "AimInaccuracyDecrease",
+}
+
+-- ============================================================
+-- КЕШ: ищем ammo/jammed/zero ОДИН РАЗ при смене оружия
+-- ============================================================
+local ToolCache = {}
+
+-- Поиск источника ammo (Attributes → Tool → Character → Backpack)
+local function findAmmoSource(tool)
+   if not tool then return nil end
+   local attrs = { "ACSClientAmmoInGun", "AmmoInGun", "CurrentAmmo", "ClipAmmo",
+      "MagAmmo", "Ammo", "AmmoCount", "BulletsInGun", "RoundsInGun",
+      "BulletsLeft", "RoundsLeft", "ShellsInGun" }
+   for _, attr in ipairs(attrs) do
+      local ok, val = pcall(function() return tool:GetAttribute(attr) end)
+      if ok and val ~= nil and type(val) == "number" then return "attr", attr end
+   end
+   for _, d in ipairs(tool:GetDescendants()) do
+      if (d:IsA("IntValue") or d:IsA("NumberValue")) and isAmmoName(d.Name) then return "inst", d end
+   end
+   if LocalPlayer.Character then
+      for _, d in ipairs(LocalPlayer.Character:GetDescendants()) do
+         if (d:IsA("IntValue") or d:IsA("NumberValue")) and isAmmoName(d.Name) then return "inst", d end
+      end
+   end
+   local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+   if backpack then
+      for _, d in ipairs(backpack:GetDescendants()) do
+         if (d:IsA("IntValue") or d:IsA("NumberValue")) and isAmmoName(d.Name) then return "inst", d end
+      end
+   end
+   return nil
+end
+
+-- Поиск источника jammed
+local function findJammedSource(tool)
+   if not tool then return nil end
+   local attrs = { "ACSClientJammed", "Jammed", "IsJammed", "JammedState", "IsJam", "GunJammed", "WeaponJammed" }
+   for _, attr in ipairs(attrs) do
+      local ok, val = pcall(function() return tool:GetAttribute(attr) end)
+      if ok and val ~= nil then return "attr", attr end
+   end
+   local function scan(root)
+      if not root then return nil end
+      for _, d in ipairs(root:GetDescendants()) do
+         if isJammedName(d.Name) then return d end
+      end
+      return nil
+   end
+   local found = scan(tool) or scan(LocalPlayer.Character)
+   if found then return "inst", found end
+   local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+   if backpack then
+      local f = scan(backpack)
+      if f then return "inst", f end
+   end
+   return nil
+end
+
+-- Собираем кеш для Tool (один раз при смене)
+local function buildToolCache(tool)
+   if not tool then return nil end
+   local cache = { AmmoInst=nil, AmmoAttr=nil, JammedInst=nil, JammedAttr=nil,
+      ZeroInstances={}, ZeroPaths={}, Settings=nil }
+   local ammoType, ammoRef = findAmmoSource(tool)
+   if ammoType == "attr" then cache.AmmoAttr = ammoRef
+   elseif ammoType == "inst" then cache.AmmoInst = ammoRef end
+   local jamType, jamRef = findJammedSource(tool)
+   if jamType == "attr" then cache.JammedAttr = jamRef
+   elseif jamType == "inst" then cache.JammedInst = jamRef end
+   local function collectZero(root)
+      if not root then return end
+      for _, d in ipairs(root:GetDescendants()) do
+         if (d:IsA("IntValue") or d:IsA("NumberValue")) and isZeroName(d.Name) then
+            cache.ZeroInstances[d] = d.Value
+         end
+      end
+   end
+   collectZero(tool)
+   collectZero(LocalPlayer.Character)
+   local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+   if backpack then collectZero(backpack) end
+   local settings = getOrCreateSettings(tool)
+   if settings then
+      cache.Settings = settings
+      for _, path in ipairs(ZERO_RECOIL_PATHS_STATIC) do
+         local val, ok = getByPath(settings, path)
+         if ok then cache.ZeroPaths[path] = val end
+      end
+   end
+   ToolCache[tool] = cache
+   return cache
+end
+
+-- Читаем ammo из кеша (мгновенно)
+local function getAmmoInGun(tool)
+   if not tool then return 0, false, nil end
+   local cache = ToolCache[tool]
+   if not cache then cache = buildToolCache(tool) end
+   if not cache then return 0, false, nil end
+   if cache.AmmoAttr then
+      local ok, val = pcall(function() return tool:GetAttribute(cache.AmmoAttr) end)
+      if ok and type(val) == "number" then return val, true, "attr:" .. cache.AmmoAttr end
+   end
+   if cache.AmmoInst and cache.AmmoInst.Parent then
+      return cache.AmmoInst.Value, true, "val:" .. cache.AmmoInst.Name
+   end
+   return 0, false, nil
+end
+
+-- Читаем jammed из кеша
+local function getJammed(tool)
+   if not tool then return false end
+   local cache = ToolCache[tool]
+   if not cache then cache = buildToolCache(tool) end
+   if not cache then return false end
+   if cache.JammedAttr then
+      local ok, val = pcall(function() return tool:GetAttribute(cache.JammedAttr) end)
+      if ok and val ~= nil then
+         if type(val) == "boolean" then return val end
+         if type(val) == "number" then return val ~= 0 end
+      end
+   end
+   if cache.JammedInst and cache.JammedInst.Parent then
+      local v = cache.JammedInst.Value
+      if typeof(v) == "boolean" then return v end
+      if typeof(v) == "number" then return v ~= 0 end
+   end
+   return false
+end
+
+-- Проверка можно ли стрелять
+local function canShoot(tool)
+   if not tool then return false end
+   if SETTINGS.CheckJammed and getJammed(tool) then return false end
+   if SETTINGS.CheckAmmo then
+      local ammo, hasData = getAmmoInGun(tool)
+      if hasData and ammo <= 0 then return false end
+   end
+   return true
+end
+
+-- Обнуляем recoil/spread
+local function zeroStats(tool)
+   if not tool then return end
+   local cache = ToolCache[tool]
+   if not cache then cache = buildToolCache(tool) end
+   if not cache then return end
+   for inst, _ in pairs(cache.ZeroInstances) do
+      if inst and inst.Parent then pcall(function() inst.Value = 0 end) end
+   end
+   if cache.Settings then
+      for path, _ in pairs(cache.ZeroPaths) do setByPathSafe(cache.Settings, path, 0) end
+   end
+end
+
+-- Восстанавливаем оригинальные значения
+local function restoreOriginalStats(tool)
+   if not tool then return end
+   local cache = ToolCache[tool]
+   if not cache then return end
+   for inst, val in pairs(cache.ZeroInstances) do
+      if inst and inst.Parent then pcall(function() inst.Value = val end) end
+   end
+   if cache.Settings then
+      for path, val in pairs(cache.ZeroPaths) do setByPathSafe(cache.Settings, path, val) end
+   end
+   ToolCache[tool] = nil
+end
+
+local function restoreAllStats()
+   for tool in pairs(ToolCache) do restoreOriginalStats(tool) end
+end
+
+local function saveOriginalStats(tool)
+   if tool and not ToolCache[tool] then buildToolCache(tool) end
+end
+
+-- ============================================================
+-- МЫШЬ: блокировка / разблокировка
+-- ============================================================
+local mouseBlocked = false
+local originalMouseBehavior = nil
+local savedMouseIcon = nil
+
+local function blockMouse()
+   if mouseBlocked then return end
+   mouseBlocked = true
+   originalMouseBehavior = UserInputService.MouseBehavior
+   pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition end)
+   pcall(function()
+      savedMouseIcon = UserInputService.MouseIconEnabled
+      UserInputService.MouseIconEnabled = false
+   end)
+end
+
+local function unblockMouse()
+   if not mouseBlocked then return end
+   mouseBlocked = false
+   pcall(function()
+      if originalMouseBehavior then UserInputService.MouseBehavior = originalMouseBehavior end
+   end)
+   pcall(function()
+      if savedMouseIcon ~= nil then UserInputService.MouseIconEnabled = savedMouseIcon end
+   end)
+end
+
+-- ============================================================
+-- NPC collector (для Silent Aim)
+-- ============================================================
+local npcCache = { list = {}, lastUpdate = 0 }
+local function collectNPCs()
+   local now = tick()
+   if now - npcCache.lastUpdate < 0.5 then return npcCache.list end
+   local npcs = {}
+   local myChar = LocalPlayer.Character
+   local function scan(container, depth)
+      if depth > 6 then return end
+      local ok, children = pcall(function() return container:GetChildren() end)
+      if not ok then return end
+      for _, obj in ipairs(children) do
+         if obj:IsA("Model") then
+            local hum = obj:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and not Players:GetPlayerFromCharacter(obj) and obj ~= myChar then
+               npcs[#npcs+1] = obj
+            end
+         end
+         if obj ~= Players and obj ~= myChar then pcall(scan, obj, depth + 1) end
+      end
+   end
+   scan(Workspace, 0)
+   npcCache.list = npcs
+   npcCache.lastUpdate = now
+   return npcs
+end
+
+-- Какая часть тела цели
+local function getTargetPartV16(model)
+   if SETTINGS.TargetPart == "Head" then return model:FindFirstChild("Head") end
+   if SETTINGS.TargetPart == "Torso" then
+      return model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model:FindFirstChild("HumanoidRootPart")
+   end
+   return model:FindFirstChild(SETTINGS.TargetPart) or model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+end
+
+-- Проверка, что цель жива
+local function isAlive(model)
+   if not model or not model.Parent then return false end
+   local hum = model:FindFirstChildOfClass("Humanoid")
+   return hum and hum.Health > 0
+end
+
+-- Позиция ствола (для wallbang)
+local function getMuzzlePosition(tool)
+   if not tool then return nil end
+   local candidates = { "Muzzle", "muzzle", "MuzzlePoint", "muzzlePoint", "BarrelPoint", "Tip", "tip" }
+   for _, name in ipairs(candidates) do
+      local found = tool:FindFirstChild(name, true)
+      if found and found:IsA("Attachment") then return found.WorldPosition end
+   end
+   local partNames = { "Muzzle", "muzzle", "Barrel", "barrel", "Tip", "tip", "MuzzlePoint" }
+   for _, name in ipairs(partNames) do
+      local found = tool:FindFirstChild(name, true)
+      if found and found:IsA("BasePart") then return found.Position end
+   end
+   local handle = tool:FindFirstChild("Handle")
+   if handle and handle:IsA("BasePart") then return handle.Position + handle.CFrame.LookVector * 1.5 end
+   return nil
+end
+
+local function getEquippedTool()
+   local char = LocalPlayer.Character
+   if not char then return nil end
+   return char:FindFirstChildOfClass("Tool")
+end
+
+-- ============================================================
+-- WALLBANG: измерение толщины стен
+-- ============================================================
+local function measureWallThickness(enterPos, direction, hitPart, targetParent)
+   local insideOrigin = enterPos + direction.Unit * 0.05
+   local insideParams = RaycastParams.new()
+   insideParams.FilterType = Enum.RaycastFilterType.Exclude
+   local filterList = { LocalPlayer.Character, targetParent }
+   if hitPart then table.insert(filterList, hitPart) end
+   insideParams.FilterDescendantsInstances = filterList
+   insideParams.IgnoreWater = true
+   local exitResult = Workspace:Raycast(insideOrigin, direction.Unit * 50, insideParams)
+   if not exitResult then return 50 end
+   return (exitResult.Position - enterPos).Magnitude
+end
+
+local function measureTotalWalls(myRoot, targetPart)
+   local params = RaycastParams.new()
+   params.FilterType = Enum.RaycastFilterType.Exclude
+   params.FilterDescendantsInstances = { LocalPlayer.Character, targetPart.Parent }
+   params.IgnoreWater = true
+   local origin = myRoot.Position
+   if SETTINGS.WallOriginMode == "muzzle" then
+      local tool = getEquippedTool()
+      local muzzlePos = tool and getMuzzlePosition(tool) or nil
+      if muzzlePos then origin = muzzlePos end
+   elseif SETTINGS.WallOriginMode == "camera" then
+      origin = Camera.CFrame.Position
+   end
+   local direction = targetPart.Position - origin
+   local totalThickness, tooThick, maxSingle, lastHitInstance = 0, false, 0, nil
+   for i = 1, 32 do
+      local result = Workspace:Raycast(origin, direction, params)
+      if not result then break end
+      if result.Instance and result.Instance:IsDescendantOf(targetPart.Parent) then break end
+      local hitModel = result.Instance and result.Instance:FindFirstAncestorOfClass("Model")
+      if hitModel and hitModel == targetPart.Parent then break end
+      local hitPart = result.Instance
+      if hitPart == lastHitInstance then
+         local skipOrigin = result.Position + direction.Unit * 0.5
+         direction = targetPart.Position - skipOrigin
+         if direction.Magnitude < 0.1 then break end
+         origin = skipOrigin
+         continue
+      end
+      lastHitInstance = hitPart
+      local thickness = measureWallThickness(result.Position, direction, hitPart, targetPart.Parent)
+      if thickness > maxSingle then maxSingle = thickness end
+      if thickness > SETTINGS.MaxWallThickness then tooThick = true; return totalThickness, true, maxSingle end
+      totalThickness = totalThickness + thickness
+      local step = thickness + 0.2
+      local newOrigin = result.Position + direction.Unit * step
+      newOrigin = newOrigin + result.Normal * 0.05
+      direction = targetPart.Position - newOrigin
+      if direction.Magnitude < 0.1 then break end
+      origin = newOrigin
+   end
+   return totalThickness, tooThick, maxSingle
+end
+
+local lastTarget, lastReason, lastWallInfo = nil, "", ""
+
+-- Сила wallbang у оружия
+local function getWallbangPower(tool)
+   if SETTINGS.WallbangOverride then return SETTINGS.WallbangOverrideVal, "override" end
+   local settings = getOrCreateSettings(tool)
+   if not settings then return 0, "0" end
+   local function deepSearch(tbl, depth)
+      if depth > 4 or type(tbl) ~= "table" then return nil, nil end
+      for k, v in pairs(tbl) do
+         if type(k) == "string" then
+            local nk = normalizeName(k)
+            if not nk:find("bulletpen") then
+               if type(v) == "number" and (nk:find("wallbang") or nk == "penetration"
+                  or nk == "penetrationpower" or nk == "wallpenetration"
+                  or nk == "penetrationamount" or nk == "penetrationdepth") then
+                  return v, k
+               end
+            end
+         end
+         if type(v) == "table" then
+            local f, fk = deepSearch(v, depth + 1)
+            if f then return f, fk end
+         end
+      end
+      return nil, nil
+   end
+   local val, key = deepSearch(settings, 0)
+   if type(val) ~= "number" then val = 0 end
+   return val * SETTINGS.WallbangMult, (key or "0")
+end
+
+-- Можем ли пробить стены до цели
+local function canHitTarget(targetPart)
+   if not SETTINGS.WallCheck then return true, 0, "wallcheck_off" end
+   local myChar = LocalPlayer.Character
+   if not myChar then return false, 0, "no_char" end
+   local myRoot = myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Head")
+   if not myRoot then return false, 0, "no_root" end
+   local totalThickness, tooThick, maxSingle = measureTotalWalls(myRoot, targetPart)
+   if tooThick then
+      return false, totalThickness, "too_thick_wall (single=" .. string.format("%.1f", maxSingle) .. ")"
+   end
+   if totalThickness <= 0.01 then return true, 0, "clear" end
+   local char = LocalPlayer.Character
+   local tool = char and char:FindFirstChildOfClass("Tool") or nil
+   local wbPower = getWallbangPower(tool)
+   if wbPower <= 0 then return false, totalThickness, "no_wallbang" end
+   if totalThickness <= wbPower then
+      return true, totalThickness, "wb_ok (thick=" .. string.format("%.1f", totalThickness) .. " ≤ " .. string.format("%.1f", wbPower) .. ")"
+   end
+   return false, totalThickness, "too_thick"
+end
+
+-- Поиск цели для Silent Aim (FOV от курсора)
+local function findTargetV16()
+   local best, bestDist = nil, SETTINGS.FOV
+   local mousePos = UserInputService:GetMouseLocation()
+   local myChar = LocalPlayer.Character
+   if not myChar then return nil end
+   local myRoot = myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Head")
+   if not myRoot then return nil end
+   local candidates = {}
+   if SETTINGS.TargetNPCs then
+      for _, npc in ipairs(collectNPCs()) do candidates[#candidates+1] = npc end
+   end
+   if SETTINGS.TargetPlayers then
+      for _, plr in ipairs(Players:GetPlayers()) do
+         if plr ~= LocalPlayer and plr.Character and plr.Character ~= myChar then
+            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+               if SETTINGS.TeamCheck and plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then continue end
+               candidates[#candidates+1] = plr.Character
+            end
+         end
+      end
+   end
+   local bestBlockReason = ""
+   for _, model in ipairs(candidates) do
+      if isAlive(model) then
+         local part = getTargetPartV16(model)
+         if part then
+            local dist = (part.Position - myRoot.Position).Magnitude
+            if dist <= SETTINGS.MaxDistance then
+               local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+               if onScreen then
+                  local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                  if screenDist < bestDist then
+                     local canHit, _, reason = canHitTarget(part)
+                     if canHit then
+                        bestDist = screenDist
+                        best = part
+                        lastReason = reason
+                     else
+                        bestBlockReason = reason
+                     end
+                  end
+               end
+            end
+         end
+      end
+   end
+   lastTarget = best
+   if not best and bestBlockReason ~= "" then lastWallInfo = "BLOCKED: " .. bestBlockReason
+   else lastWallInfo = lastReason end
+   return best
+end
+
+-- Симуляция клика
+local function mouseClickV16()
+   if typeof(mouse1click) == "function" then mouse1click(); return end
+   if typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
+      mouse1press(); task.wait(0.01); mouse1release(); return
+   end
+   local VIM = game:GetService("VirtualInputManager")
+   local loc = UserInputService:GetMouseLocation()
+   pcall(function() VIM:SendMouseButtonEvent(loc.X, loc.Y, 0, true, game, 1) end)
+   task.wait(0.01)
+   pcall(function() VIM:SendMouseButtonEvent(loc.X, loc.Y, 0, false, game, 1) end)
+end
+
+-- ============================================================
+-- SNAP FIRE RESTORE (Silent Aim)
+-- ============================================================
+local Firing = false
+local originalCF = nil
+
+local function snapFireRestore(targetPart)
+   if Firing then return end
+   Firing = true
+   local ok, err = pcall(function()
+      if not isAlive(targetPart.Parent) then return end
+      local tool = getEquippedTool()
+      if not tool then return end
+      if not canShoot(tool) then return end
+      if SETTINGS.BlockMouse then blockMouse() end
+      originalCF = Camera.CFrame
+      -- ФАЗА 1: SNAP — держим камеру на цели
+      local elapsed = 0
+      while elapsed < SETTINGS.SnapDelay and not Unloaded do
+         if not isAlive(targetPart.Parent) then break end
+         Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, targetPart.Position)
+         task.wait(0.01)
+         elapsed = elapsed + 0.01
+      end
+      if not isAlive(targetPart.Parent) then
+         Camera.CFrame = originalCF; originalCF = nil
+         if SETTINGS.BlockMouse then unblockMouse() end
+         return
+      end
+      tool = getEquippedTool()
+      if not canShoot(tool) then
+         Camera.CFrame = originalCF; originalCF = nil
+         if SETTINGS.BlockMouse then unblockMouse() end
+         return
+      end
+      -- ФАЗА 2: КЛИКИ
+      for i = 1, SETTINGS.ClicksCount do
+         if Unloaded or not isAlive(targetPart.Parent) then break end
+         Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, targetPart.Position)
+         task.wait(SETTINGS.ClickInterval)
+         if Unloaded or not isAlive(targetPart.Parent) then break end
+         Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, targetPart.Position)
+         if SETTINGS.AutoFire then mouseClickV16() end
+      end
+      -- ФАЗА 3: HOLD AFTER SHOT
+      local holdTime = math.max(0.001, SETTINGS.HoldAfterShot)
+      local held = 0
+      while held < holdTime and not Unloaded do
+         if not isAlive(targetPart.Parent) then break end
+         Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, targetPart.Position)
+         task.wait(0.001)
+         held = held + 0.001
+      end
+      -- Возврат камеры
+      if originalCF then Camera.CFrame = originalCF; originalCF = nil end
+      if SETTINGS.BlockMouse then unblockMouse() end
+      -- Zero Recoil после выстрела
+      if SETTINGS.ZeroRecoil or SETTINGS.ZeroSpread then
+         local t = getEquippedTool()
+         if t then zeroStats(t) end
+      end
+   end)
+   if not ok then
+      if originalCF then pcall(function() Camera.CFrame = originalCF end) originalCF = nil end
+      if SETTINGS.BlockMouse then unblockMouse() end
+   end
+   Firing = false
+end
+
+-- ============================================================
+-- TRIGGER BOT
+-- ============================================================
+-- Проверка: курсор находится на цели (одной из выбранных частей)
+local function isCrosshairOnTarget()
+   local cam = Workspace.CurrentCamera
+   if not cam then return false end
+   local mousePos = UserInputService:GetMouseLocation()
+   local myChar = LocalPlayer.Character
+   if not myChar then return false end
+   local myRoot = myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Head")
+   if not myRoot then return false end
+
+   -- Собираем список целей
+   local candidates = {}
+   if SETTINGS.TargetNPCs then
+      for _, npc in ipairs(collectNPCs()) do candidates[#candidates+1] = npc end
+   end
+   if SETTINGS.TargetPlayers then
+      for _, plr in ipairs(Players:GetPlayers()) do
+         if plr ~= LocalPlayer and plr.Character and plr.Character ~= myChar then
+            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+               if SETTINGS.TeamCheck and plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then continue end
+               candidates[#candidates+1] = plr.Character
+            end
+         end
+      end
+   end
+
+   -- Какие части проверять
+   local partsToCheck = {}
+   if SETTINGS.TriggerTargets.All then
+      partsToCheck = {"Head", "Torso", "Center"}
+   else
+      if SETTINGS.TriggerTargets.Head then table.insert(partsToCheck, "Head") end
+      if SETTINGS.TriggerTargets.Torso then table.insert(partsToCheck, "Torso") end
+   end
+   if #partsToCheck == 0 then return false end
+
+   -- Проверяем каждую часть каждой цели
+   for _, model in ipairs(candidates) do
+      if isAlive(model) then
+         for _, pType in ipairs(partsToCheck) do
+            local part = getPartFromCharacter(model, pType)
+            if part then
+               local dist = (part.Position - myRoot.Position).Magnitude
+               if dist <= SETTINGS.MaxDistance then
+                  -- Проекция на экран
+                  local screenPos, onScreen = cam:WorldToViewportPoint(part.Position)
+                  if onScreen then
+                     local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                     -- Если курсор близко к части (30 px)
+                     if screenDist < 30 then
+                        -- Проверяем стены
+                        if SETTINGS.TriggerWallCheck then
+                           if not hasLineOfSightFor(myRoot.Position, part, true) then
+                              continue
+                           end
+                        end
+                        return true, part
+                     end
+                  end
+               end
+            end
+         end
+      end
+   end
+   return false, nil
+end
+
+-- Цикл Trigger Bot
+task.spawn(function()
+   while not Unloaded do
+      task.wait(0.01)
+      if not SETTINGS.TriggerEnabled then
+         task.wait(0.1)
+         continue
+      end
+      if not isAimHeld() then
+         task.wait(0.05)
+         continue
+      end
+      local tool = getEquippedTool()
+      if tool and not canShoot(tool) then
+         task.wait(0.05)
+         continue
+      end
+      local onTarget = isCrosshairOnTarget()
+      if onTarget then
+         task.wait(SETTINGS.TriggerHoldBefore)
+         if Unloaded then break end
+         local still = isCrosshairOnTarget()
+         if still then
+            if typeof(mouse1click) == "function" then mouse1click()
+            elseif typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
+               mouse1press(); task.wait(0.01); mouse1release()
+            else
+               local VIM = game:GetService("VirtualInputManager")
+               local loc = UserInputService:GetMouseLocation()
+               pcall(function() VIM:SendMouseButtonEvent(loc.X, loc.Y, 0, true, game, 1) end)
+               task.wait(0.01)
+               pcall(function() VIM:SendMouseButtonEvent(loc.X, loc.Y, 0, false, game, 1) end)
+            end
+            task.wait(SETTINGS.TriggerCooldown)
+         end
+      else
+         task.wait(0.02)
+      end
+   end
+end)
+
+-- ============================================================
+-- ЦИКЛЫ SILENT AIM и ZERO RECOIL
+-- ============================================================
+task.spawn(function()
+   while not Unloaded do
+      local speed = math.max(0.1, SETTINGS.LoopSpeedMult)
+      if SETTINGS.Enabled and not Firing and isAimHeld() then
+         local target = findTargetV16()
+         if target and isAlive(target.Parent) then
+            snapFireRestore(target)
+            local cd
+            local untilDeath = false
+            if SETTINGS.RepeatMode == "Time" then
+               if SETTINGS.FixedTimeDelay <= 0 then
+                  untilDeath = true
+                  cd = 0
+               else
+                  cd = SETTINGS.FixedTimeDelay / speed
+               end
+            else
+               local rpm = 600
+               local t = getEquippedTool()
+               if t then
+                  local mod = t:FindFirstChild("ACS_Settings")
+                  if mod then
+                     local ok, settings = pcall(require, mod)
+                     if ok and type(settings) == "table" then
+                        rpm = settings.ShootRate or settings.FireRate or settings.RPM or 600
+                     end
+                  end
+               end
+               cd = ((60 / rpm) * SETTINGS.CooldownMult) / speed
+            end
+            if untilDeath then
+               while isAlive(target.Parent) and not Unloaded do task.wait(0.02) end
+            else
+               local t = 0
+               while t < cd and not Unloaded do
+                  task.wait(0.02); t = t + 0.02
+                  if not isAlive(target.Parent) then break end
+               end
+            end
+         else
+            task.wait(0.1 / speed)
+         end
+      else
+         task.wait(0.1 / speed)
+      end
+   end
+end)
+
+-- Цикл смены оружия (восстанавливаем Zero Recoil)
+task.spawn(function()
+   local lastEquippedTool = nil
+   while not Unloaded do
+      local tool = getEquippedTool()
+      if lastEquippedTool ~= tool then
+         if lastEquippedTool then restoreOriginalStats(lastEquippedTool) end
+         lastEquippedTool = tool
+         if tool then buildToolCache(tool) end
+         if tool and (SETTINGS.ZeroRecoil or SETTINGS.ZeroSpread) then zeroStats(tool) end
+      end
+      task.wait(0.5 / math.max(0.1, SETTINGS.LoopSpeedMult))
+   end
+end)
+
+-- ============================================================
+-- RAYFIELD WINDOW
+-- ============================================================
+local Window = Rayfield:CreateWindow({
+   Name = "Silent Aim v16+",
+   Icon = 0,
+   LoadingTitle = "Silent Aim v16+",
+   LoadingSubtitle = "Trigger Bot edition",
+   Theme = "Default",
+   DisableRayfieldPrompts = false,
+   DisableBuildWarnings = false,
+   ConfigurationSaving = { Enabled = true, FolderName = nil, FileName = "SilentAim_v16" },
+   Discord = { Enabled = false, Invite = "noinvitelink", RememberJoins = true },
+   KeySystem = false,
+   KeySettings = {
+      Title = "Untitled", Subtitle = "Key System",
+      Note = "No method of obtaining the key is provided",
+      FileName = "Key", SaveKey = true, GrabKeyFromSite = false, Key = {"Hello"}
+   }
+})
+
+-- ============================================================
+-- CF RAME AIM TAB
+-- ============================================================
+local CframeTab = Window:CreateTab("Cframe Aim", 4483362458)
+CframeTab:CreateToggle({ Name = "Enable Cframe Aim", CurrentValue = false, Flag = "Cframe_Enabled",
+   Callback = function(v) State.Cframe.Enabled = v end })
+CframeTab:CreateSlider({ Name = "Speed", Range = {0, 100}, Increment = 1, Suffix = "", CurrentValue = 50,
+   Flag = "Cframe_Speed", Callback = function(v) State.Cframe.Speed = v end })
+CframeTab:CreateToggle({ Name = "Loop Target", CurrentValue = false, Flag = "Cframe_Loop",
+   Callback = function(v) State.Cframe.LoopTarget = v; if not v then State.Cframe.Locked = nil end end })
+CframeTab:CreateSection("Targets")
+CframeTab:CreateDropdown({ Name = "Targets", Options = {"Player", "Npc_Humanoid", "Npc_Workspace"},
+   CurrentOption = {"Player"}, MultipleOptions = true, Flag = "Cframe_Targets",
+   Callback = function(opts)
+      State.Targets.Player = false; State.Targets.Npc_Humanoid = false; State.Targets.Npc_Workspace = false
+      for _, o in ipairs(opts) do State.Targets[o] = true end
+   end })
+CframeTab:CreateDropdown({ Name = "Target Part", Options = {"Head", "Torso", "Center"}, CurrentOption = {"Head"},
+   Flag = "Cframe_Part", Callback = function(opt) State.TargetPart = opt[1] end })
+CframeTab:CreateSection("Prediction")
+CframeTab:CreateDropdown({ Name = "Predict Mode", Options = {"Custom", "Auto"}, CurrentOption = {"Custom"},
+   Flag = "Cframe_PredictMode", Callback = function(opt) State.PredictMode = opt[1] end })
+CframeTab:CreateSlider({ Name = "Predict (ms)", Range = {1, 100}, Increment = 1, Suffix = "ms", CurrentValue = 50,
+   Flag = "Cframe_PredictValue", Callback = function(v) State.PredictCustom = v end })
+CframeTab:CreateSection("Misc")
+CframeTab:CreateToggle({ Name = "Wall Check", CurrentValue = true, Flag = "Cframe_WallCheck",
+   Callback = function(v) State.WallCheck = v end })
+
+-- ============================================================
+-- MOUSE AIM TAB
+-- ============================================================
+local MouseTab = Window:CreateTab("Mouse Aim", 4483362458)
+MouseTab:CreateToggle({ Name = "Enable Mouse Aim", CurrentValue = false, Flag = "Mouse_Enabled",
+   Callback = function(v) State.Mouse.Enabled = v end })
+MouseTab:CreateSlider({ Name = "Speed", Range = {0, 50}, Increment = 1, Suffix = "", CurrentValue = 25,
+   Flag = "Mouse_Speed", Callback = function(v) State.Mouse.Speed = v end })
+MouseTab:CreateToggle({ Name = "Loop Target", CurrentValue = false, Flag = "Mouse_Loop",
+   Callback = function(v) State.Mouse.LoopTarget = v; if not v then State.Mouse.Locked = nil end end })
+MouseTab:CreateSection("Targets")
+MouseTab:CreateDropdown({ Name = "Targets", Options = {"Player", "Npc_Humanoid", "Npc_Workspace"},
+   CurrentOption = {"Player"}, MultipleOptions = true, Flag = "Mouse_Targets",
+   Callback = function(opts)
+      State.Targets.Player = false; State.Targets.Npc_Humanoid = false; State.Targets.Npc_Workspace = false
+      for _, o in ipairs(opts) do State.Targets[o] = true end
+   end })
+MouseTab:CreateDropdown({ Name = "Target Part", Options = {"Head", "Torso", "Center"}, CurrentOption = {"Head"},
+   Flag = "Mouse_Part", Callback = function(opt) State.TargetPart = opt[1] end })
+MouseTab:CreateSection("Prediction")
+MouseTab:CreateDropdown({ Name = "Predict Mode", Options = {"Custom", "Auto"}, CurrentOption = {"Custom"},
+   Flag = "Mouse_PredictMode", Callback = function(opt) State.PredictMode = opt[1] end })
+MouseTab:CreateSlider({ Name = "Predict (ms)", Range = {1, 100}, Increment = 1, Suffix = "ms", CurrentValue = 50,
+   Flag = "Mouse_PredictValue", Callback = function(v) State.PredictCustom = v end })
+MouseTab:CreateSection("Misc")
+MouseTab:CreateToggle({ Name = "Wall Check", CurrentValue = true, Flag = "Mouse_WallCheck",
+   Callback = function(v) State.WallCheck = v end })
+
+-- ============================================================
+-- SILENT AIM TAB
+-- ============================================================
+local SilentTab = Window:CreateTab("Silent Aim", 4483362458)
+SilentTab:CreateToggle({ Name = "Enable Silent Aim", CurrentValue = false, Flag = "SA_Enabled",
+   Callback = function(v) SETTINGS.Enabled = v end })
+SilentTab:CreateToggle({ Name = "Auto-Fire", CurrentValue = true, Flag = "SA_AutoFire",
+   Callback = function(v) SETTINGS.AutoFire = v end })
+SilentTab:CreateToggle({ Name = "Block Mouse", CurrentValue = true, Flag = "SA_BlockMouse",
+   Callback = function(v) SETTINGS.BlockMouse = v end })
+SilentTab:CreateToggle({ Name = "Check Ammo", CurrentValue = true, Flag = "SA_CheckAmmo",
+   Callback = function(v) SETTINGS.CheckAmmo = v end })
+SilentTab:CreateToggle({ Name = "Check Jammed", CurrentValue = true, Flag = "SA_CheckJammed",
+   Callback = function(v) SETTINGS.CheckJammed = v end })
+SilentTab:CreateSlider({ Name = "FOV Radius", Range = {10, 800}, Increment = 1, Suffix = "px",
+   CurrentValue = 300, Flag = "SA_FOV", Callback = function(v) SETTINGS.FOV = v end })
+SilentTab:CreateSlider({ Name = "Max Distance", Range = {100, 5000}, Increment = 50, Suffix = "m",
+   CurrentValue = 1000, Flag = "SA_MaxDist", Callback = function(v) SETTINGS.MaxDistance = v end })
+SilentTab:CreateSlider({ Name = "Snap Delay", Range = {0.001, 5.0}, Increment = 0.001, Suffix = "s",
+   CurrentValue = 0.02, Flag = "SA_SnapDelay", Callback = function(v) SETTINGS.SnapDelay = v end })
+SilentTab:CreateSlider({ Name = "Hold After Shot", Range = {0.001, 5.0}, Increment = 0.001, Suffix = "s",
+   CurrentValue = 0.001, Flag = "SA_HoldAfter", Callback = function(v) SETTINGS.HoldAfterShot = v end })
+SilentTab:CreateSlider({ Name = "Clicks Count", Range = {1, 5}, Increment = 1, Suffix = " clicks",
+   CurrentValue = 1, Flag = "SA_ClicksCount", Callback = function(v) SETTINGS.ClicksCount = v end })
+SilentTab:CreateSlider({ Name = "Click Interval", Range = {0.001, 1.0}, Increment = 0.001, Suffix = "s",
+   CurrentValue = 0.02, Flag = "SA_ClickInterval", Callback = function(v) SETTINGS.ClickInterval = v end })
+SilentTab:CreateSlider({ Name = "Loop Speed ×", Range = {0.1, 5.0}, Increment = 0.1, Suffix = "x",
+   CurrentValue = 1.0, Flag = "SA_LoopSpeed", Callback = function(v) SETTINGS.LoopSpeedMult = v end })
+
+SilentTab:CreateSection("Aim Check")
+SilentTab:CreateToggle({ Name = "Enable Aim Check", CurrentValue = true, Flag = "SA_AimCheckEnabled",
+   Callback = function(v) SETTINGS.AimCheckEnabled = v end })
+SilentTab:CreateDropdown({ Name = "Aim Key", Options = {"MouseButton2", "MouseButton1", "E", "Q", "F", "LeftAlt", "RightAlt", "LeftShift"},
+   CurrentOption = {"MouseButton2"}, Flag = "SA_AimKey",
+   Callback = function(opt)
+      local k = opt[1]
+      if k:find("MouseButton") then
+         SETTINGS.AimCheckKey = Enum.UserInputType[k]
+      else
+         SETTINGS.AimCheckKey = Enum.KeyCode[k]
+      end
+   end })
+
+SilentTab:CreateSection("Repeat Mode")
+SilentTab:CreateDropdown({ Name = "Mode", Options = {"RPM", "Time"},
+   CurrentOption = {"RPM"}, Flag = "SA_RepeatMode",
+   Callback = function(opt) SETTINGS.RepeatMode = opt[1] end })
+SilentTab:CreateSlider({ Name = "Fixed Time (s) [0 = until death]", Range = {0.0, 5.0}, Increment = 0.01, Suffix = "s",
+   CurrentValue = 0.5, Flag = "SA_FixedTime", Callback = function(v) SETTINGS.FixedTimeDelay = v end })
+
+SilentTab:CreateSection("Target")
+SilentTab:CreateToggle({ Name = "Target NPCs", CurrentValue = true, Flag = "SA_TargetNPCs",
+   Callback = function(v) SETTINGS.TargetNPCs = v end })
+SilentTab:CreateToggle({ Name = "Target Players", CurrentValue = false, Flag = "SA_TargetPlayers",
+   Callback = function(v) SETTINGS.TargetPlayers = v end })
+SilentTab:CreateToggle({ Name = "Team Check", CurrentValue = true, Flag = "SA_TeamCheck",
+   Callback = function(v) SETTINGS.TeamCheck = v end })
+SilentTab:CreateDropdown({ Name = "Target Part", Options = {"Head", "Torso"}, CurrentOption = {"Head"},
+   Flag = "SA_TargetPart", Callback = function(opt) SETTINGS.TargetPart = opt[1] end })
+SilentTab:CreateSection("Misc")
+SilentTab:CreateToggle({ Name = "Wall Check", CurrentValue = true, Flag = "SA_WallCheck",
+   Callback = function(v) SETTINGS.WallCheck = v end })
+SilentTab:CreateToggle({ Name = "Show FOV Circle", CurrentValue = true, Flag = "SA_ShowFOV",
+   Callback = function(v) SETTINGS.ShowFOV = v end })
+SilentTab:CreateSection("Zero Recoil")
+SilentTab:CreateToggle({ Name = "Zero Recoil", CurrentValue = false, Flag = "SA_ZeroRecoil",
+   Callback = function(v)
+      SETTINGS.ZeroRecoil = v
+      local tool = getEquippedTool()
+      if v then
+         if tool then saveOriginalStats(tool); zeroStats(tool) end
+      else
+         if tool then restoreOriginalStats(tool) end
+      end
+   end })
+SilentTab:CreateToggle({ Name = "Zero Spread", CurrentValue = false, Flag = "SA_ZeroSpread",
+   Callback = function(v) SETTINGS.ZeroSpread = v end })
+
+-- ============================================================
+-- TRIGGER BOT TAB
+-- ============================================================
+local TriggerTab = Window:CreateTab("Trigger Bot", 4483362458)
+TriggerTab:CreateToggle({ Name = "Enable Trigger Bot", CurrentValue = false, Flag = "TB_Enabled",
+   Callback = function(v) SETTINGS.TriggerEnabled = v end })
+TriggerTab:CreateSlider({ Name = "Hold Before Shot (s)", Range = {0.001, 1.0}, Increment = 0.001, Suffix = "s",
+   CurrentValue = 0.02, Flag = "TB_HoldBefore", Callback = function(v) SETTINGS.TriggerHoldBefore = v end })
+TriggerTab:CreateSlider({ Name = "Cooldown between shots (s)", Range = {0.01, 2.0}, Increment = 0.01, Suffix = "s",
+   CurrentValue = 0.1, Flag = "TB_Cooldown", Callback = function(v) SETTINGS.TriggerCooldown = v end })
+TriggerTab:CreateToggle({ Name = "Wall Check", CurrentValue = true, Flag = "TB_WallCheck",
+   Callback = function(v) SETTINGS.TriggerWallCheck = v end })
+TriggerTab:CreateSection("Target Parts (multi)")
+TriggerTab:CreateToggle({ Name = "Head", CurrentValue = true, Flag = "TB_PartHead",
+   Callback = function(v) SETTINGS.TriggerTargets.Head = v end })
+TriggerTab:CreateToggle({ Name = "Torso", CurrentValue = false, Flag = "TB_PartTorso",
+   Callback = function(v) SETTINGS.TriggerTargets.Torso = v end })
+TriggerTab:CreateToggle({ Name = "All", CurrentValue = false, Flag = "TB_PartAll",
+   Callback = function(v) SETTINGS.TriggerTargets.All = v end })
+TriggerTab:CreateParagraph({
+   Title = "Info",
+   Content = "Trigger Bot: авто-выстрел когда курсор на цели. Работает только при зажатой Aim Key. 'All' = Head + Torso + Center.",
+})
+
+-- ============================================================
+-- WALLBANG TAB
+-- ============================================================
+local WBTab = Window:CreateTab("Wallbang", 4483362458)
+WBTab:CreateSlider({ Name = "Wallbang × (mult)", Range = {0, 20}, Increment = 0.5, Suffix = "x",
+   CurrentValue = 1.0, Flag = "WB_Mult", Callback = function(v) SETTINGS.WallbangMult = v end })
+WBTab:CreateToggle({ Name = "Override", CurrentValue = false, Flag = "WB_Ovr",
+   Callback = function(v) SETTINGS.WallbangOverride = v end })
+WBTab:CreateSlider({ Name = "Override Value", Range = {0, 100}, Increment = 1, Suffix = " studs",
+   CurrentValue = 10.0, Flag = "WB_OvrVal", Callback = function(v) SETTINGS.WallbangOverrideVal = v end })
+WBTab:CreateSlider({ Name = "Max 1 Wall Thickness", Range = {0.1, 100}, Increment = 0.5, Suffix = " studs",
+   CurrentValue = 10.0, Flag = "WB_MaxThick", Callback = function(v) SETTINGS.MaxWallThickness = v end })
+WBTab:CreateDropdown({ Name = "Origin Mode", Options = {"muzzle", "camera", "root"}, CurrentOption = {"muzzle"},
+   Flag = "WB_Origin", Callback = function(opt) SETTINGS.WallOriginMode = opt[1] end })
+local WBInfo = WBTab:CreateParagraph({ Title = "Status", Content = "—" })
+
+-- ============================================================
+-- MISC TAB
+-- ============================================================
+local MiscTab = Window:CreateTab("Misc", 4483362458)
+MiscTab:CreateSection("Diagnostics")
+local diagTarget = MiscTab:CreateParagraph({ Title = "Target", Content = "—" })
+local diagWall = MiscTab:CreateParagraph({ Title = "Wall", Content = "—" })
+local diagAmmo = MiscTab:CreateParagraph({ Title = "Ammo", Content = "—" })
+local diagJammed = MiscTab:CreateParagraph({ Title = "Jammed", Content = "—" })
+local diagWB = MiscTab:CreateParagraph({ Title = "Wallbang", Content = "—" })
+local diagNPC = MiscTab:CreateParagraph({ Title = "NPC", Content = "—" })
+local diagMouse = MiscTab:CreateParagraph({ Title = "Mouse", Content = "—" })
+local diagCache = MiscTab:CreateParagraph({ Title = "Cached Tools", Content = "0" })
+local diagAim = MiscTab:CreateParagraph({ Title = "Aim Check", Content = "—" })
+local diagTrigger = MiscTab:CreateParagraph({ Title = "Trigger Bot", Content = "—" })
+MiscTab:CreateSection("Script")
+MiscTab:CreateButton({
+   Name = "Unload Script",
+   Callback = function()
+      Unloaded = true
+      SETTINGS.Enabled = false
+      SETTINGS.TriggerEnabled = false
+      State.Cframe.Enabled = false
+      State.Mouse.Enabled = false
+      if originalCF then pcall(function() Camera.CFrame = originalCF end) originalCF = nil end
+      if mouseBlocked then unblockMouse() end
+      restoreAllStats()
+      for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+      Connections = {}
+      if fovGui and fovGui.Parent then fovGui:Destroy() end
+      pcall(function() Rayfield:Destroy() end)
+   end,
+})
+
+-- ============================================================
+-- FOV — тонкий белый круг
+-- ============================================================
+local fovGui = Instance.new("ScreenGui")
+fovGui.Name = "SilentAimFOV"
+fovGui.ResetOnSpawn = false
+fovGui.IgnoreGuiInset = true
+fovGui.Parent = (gethui and gethui()) or LocalPlayer:WaitForChild("PlayerGui")
+
+local fovFrame = Instance.new("Frame")
+fovFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+fovFrame.BackgroundTransparency = 1
+fovFrame.Visible = false
+fovFrame.Parent = fovGui
+
+local fovCircleParts = {}
+local function createCircle(parent, radius)
+   local segments = 64
+   for i = 1, segments do
+      local part = Instance.new("Frame")
+      part.Size = UDim2.new(0, math.max(2, math.ceil(math.pi * 2 * radius / segments)), 0, 1)
+      part.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+      part.BorderSizePixel = 0
+      part.AnchorPoint = Vector2.new(0.5, 0.5)
+      part.Position = UDim2.new(0.5, 0, 0.5, 0)
+      part.Rotation = (i / segments) * 360
+      part.Parent = parent
+      table.insert(fovCircleParts, { part = part, radius = radius, angle = (i / segments) * 360 })
+   end
+end
+
+local function updateCircle(radius)
+   local segments = #fovCircleParts
+   if segments == 0 then return end
+   local segSize = math.max(2, math.ceil(math.pi * 2 * radius / segments))
+   for _, data in ipairs(fovCircleParts) do
+      local part = data.part
+      part.Size = UDim2.new(0, segSize, 0, 1)
+      local rad = math.rad(data.angle)
+      local x = math.cos(rad) * radius
+      local y = math.sin(rad) * radius
+      part.Position = UDim2.new(0.5, x, 0.5, y)
+      part.Rotation = data.angle
+   end
+end
+
+createCircle(fovFrame, 300)
+
+addConn(RunService.RenderStepped:Connect(function()
+   if Unloaded then return end
+   local show = SETTINGS.Enabled and SETTINGS.ShowFOV
+   fovFrame.Visible = show
+   if show then
+      local mouse = UserInputService:GetMouseLocation()
+      fovFrame.Position = UDim2.fromOffset(mouse.X, mouse.Y)
+      updateCircle(SETTINGS.FOV)
+   end
+   if mouseBlocked and typeof(mousemoverel) == "function" then
+      pcall(function() mousemoverel(0, 0) end)
+   end
+end))
+
+-- ============================================================
+-- ЦИКЛ CF RAME / MOUSE
+-- ============================================================
+addConn(RunService.RenderStepped:Connect(function()
+   if Unloaded then return end
+   local cam = Workspace.CurrentCamera
+   if not cam then return end
+   if State.Cframe.Enabled then
+      local best = findBestTarget(State.Cframe, State.Targets, State.TargetPart, State.WallCheck)
+      if best then
+         local targetPos = getPredictedPositionFor(best, State.PredictMode, State.PredictCustom)
+         local current = cam.CFrame
+         local desired = CFrame.new(current.Position, targetPos)
+         local alpha = math.clamp(State.Cframe.Speed / 100, 0.001, 1)
+         cam.CFrame = current:Lerp(desired, alpha)
+      end
+   else State.Cframe.Locked = nil end
+   if State.Mouse.Enabled then
+      local best = findBestTarget(State.Mouse, State.Targets, State.TargetPart, State.WallCheck)
+      if best then
+         local targetPos = getPredictedPositionFor(best, State.PredictMode, State.PredictCustom)
+         local screenPoint, onScreen = cam:WorldToViewportPoint(targetPos)
+         if onScreen then
+            local center = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+            local delta = Vector2.new(screenPoint.X, screenPoint.Y) - center
+            local factor = math.clamp(State.Mouse.Speed / 50, 0.001, 1)
+            local move = delta * factor
+            if mousemoverel then mousemoverel(move.X, move.Y)
+            elseif mousemoveabs then mousemoveabs(center.X + move.X, center.Y + move.Y) end
+         end
+      end
+   else State.Mouse.Locked = nil end
+end))
+
+-- ============================================================
+-- INFO LOOP
+-- ============================================================
+task.spawn(function()
+   while not Unloaded do
+      task.wait(0.5 / math.max(0.1, SETTINGS.LoopSpeedMult))
+      pcall(function()
+         if lastTarget then
+            diagTarget:Set({ Title = "Target", Content = (lastTarget.Parent and lastTarget.Parent.Name or "?") .. " → " .. lastTarget.Name })
+         else diagTarget:Set({ Title = "Target", Content = "—" }) end
+         diagWall:Set({ Title = "Wall", Content = lastWallInfo ~= "" and lastWallInfo or "—" })
+         local tool = getEquippedTool()
+         if tool then
+            local ammo, hasData, src = getAmmoInGun(tool)
+            diagAmmo:Set({ Title = "Ammo", Content = hasData and (tostring(ammo) .. " (" .. tostring(src) .. ")") or "—" })
+            local jam = getJammed(tool)
+            diagJammed:Set({ Title = "Jammed", Content = tostring(jam) })
+            local wbPower, wbKey = getWallbangPower(tool)
+            diagWB:Set({ Title = "Wallbang", Content = string.format("%.1f studs (%s)", wbPower, tostring(wbKey)) })
+         else
+            diagAmmo:Set({ Title = "Ammo", Content = "—" })
+            diagJammed:Set({ Title = "Jammed", Content = "—" })
+            diagWB:Set({ Title = "Wallbang", Content = "—" })
+         end
+         diagNPC:Set({ Title = "NPC", Content = tostring(#collectNPCs()) })
+         diagMouse:Set({ Title = "Mouse", Content = mouseBlocked and "LOCKED" or "free" })
+         diagAim:Set({ Title = "Aim Check", Content = SETTINGS.AimCheckEnabled and (isAimHeld() and "HELD ✅" or "NOT HELD ❌") or "disabled" })
+         diagTrigger:Set({ Title = "Trigger Bot", Content = SETTINGS.TriggerEnabled and "ENABLED" or "disabled" })
+         local count = 0
+         for _ in pairs(ToolCache) do count = count + 1 end
+         diagCache:Set({ Title = "Cached Tools", Content = tostring(count) })
+         if WBInfo and WBInfo.Set then
+            local tool = getEquippedTool()
+            if tool then
+               local wbPower, wbKey = getWallbangPower(tool)
+               WBInfo:Set({
+                  Title = "Status",
+                  Content = string.format("Power: %.1f studs\nSource: %s\nMax 1 wall: %.1f",
+                     wbPower, tostring(wbKey), SETTINGS.MaxWallThickness)
+               })
+            else WBInfo:Set({ Title = "Status", Content = "No tool equipped" }) end
+         end
+      end)
+   end
+end)
+
+-- ============================================================
+Rayfield:LoadConfiguration()
